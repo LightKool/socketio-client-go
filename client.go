@@ -33,9 +33,8 @@ type socketClient struct {
 	url       *url.URL
 	option    *option
 	transprot protocol.Transport
-	conn      protocol.Conn
-	errChan   chan error
 	outChan   chan *protocol.Packet
+	closeChan chan bool
 }
 
 func Socket(urlstring string) (*socketClient, error) {
@@ -53,33 +52,32 @@ func Socket(urlstring string) (*socketClient, error) {
 		url:       u,
 		option:    defaultOption,
 		transprot: protocol.NewWebSocketTransport(),
+		outChan:   make(chan *protocol.Packet, 64),
+		closeChan: make(chan bool),
 	}, nil
 }
 
-func (s *socketClient) Connect() (err error) {
+func (s *socketClient) Connect() {
 	if atomic.CompareAndSwapUint32(&s.state, stateOpen, stateConnecting) {
-		s.conn, err = s.transprot.Dial(s.url.String())
+		conn, err := s.transprot.Dial(s.url.String())
 		if err != nil {
-			atomic.StoreUint32(&s.state, stateClose)
+			s.emit(EventError, err)
+			go s.reconnect(stateConnecting)
 			return
 		}
-		s.errChan = make(chan error, 1)
-		s.outChan = make(chan *protocol.Packet, 64)
 		if atomic.CompareAndSwapUint32(&s.state, stateConnecting, stateReady) {
-			go s.start()
+			go s.start(conn)
+			s.emit(EventConnect)
+		} else {
+			conn.Close()
 		}
 	}
-	return
 }
 
 func (s *socketClient) Disconnect() {
 	atomic.StoreUint32(&s.state, stateClose)
-	err := s.conn.Close()
-	if err != nil {
-		s.emit(EventError, err)
-	}
-	close(s.errChan)
 	close(s.outChan)
+	close(s.closeChan)
 }
 
 func (s *socketClient) Emit(event string, args ...interface{}) {
@@ -100,40 +98,46 @@ func (s *socketClient) Emit(event string, args ...interface{}) {
 	}
 }
 
-func (s *socketClient) reconnect() {
-	if atomic.CompareAndSwapUint32(&s.state, stateReady, stateReconnecting) {
+func (s *socketClient) reconnect(state uint32) {
+	time.Sleep(time.Second)
+	if atomic.CompareAndSwapUint32(&s.state, state, stateReconnecting) {
 		conn, err := s.transprot.Dial(s.url.String())
-		for err != nil {
+		if err != nil {
 			s.emit(EventError, err)
-			time.Sleep(time.Second)
-			conn, err = s.transprot.Dial(s.url.String())
+			go s.reconnect(stateReconnecting)
+			return
 		}
-		old := s.conn
-		s.conn = conn
-		go old.Close()
 		if atomic.CompareAndSwapUint32(&s.state, stateReconnecting, stateReady) {
-			go s.start()
+			go s.start(conn)
+			s.emit(EventReconnect)
+		} else {
+			conn.Close()
 		}
 	}
 }
 
-func (s *socketClient) start() {
-	go s.startRead()
-	go s.startWrite()
-	for err := range s.errChan {
-		s.emit(EventError, err)
-		go s.reconnect()
+func (s *socketClient) start(conn protocol.Conn) {
+	stopper := make(chan bool)
+	go s.startRead(conn, stopper)
+	go s.startWrite(conn, stopper)
+	select {
+	case <-stopper:
+		go s.reconnect(stateReady)
+		conn.Close()
+	case <-s.closeChan:
+		conn.Close()
 	}
 }
 
-func (s *socketClient) startRead() {
+func (s *socketClient) startRead(conn protocol.Conn, stopper chan bool) {
 	defer func() {
 		recover()
 	}()
 	for atomic.LoadUint32(&s.state) == stateReady {
-		p, err := s.conn.Read()
+		p, err := conn.Read()
 		if err != nil {
-			s.errChan <- err
+			s.emit(EventError, err)
+			close(stopper)
 			return
 		}
 		switch p.Type {
@@ -142,7 +146,7 @@ func (s *socketClient) startRead() {
 			if err != nil {
 				s.emit(EventError, err)
 			} else {
-				go s.startPing(h)
+				go s.startPing(h, stopper)
 			}
 		case protocol.PacketTypePing:
 			s.outChan <- protocol.NewPongPacket()
@@ -157,29 +161,40 @@ func (s *socketClient) startRead() {
 	}
 }
 
-func (s *socketClient) startWrite() {
+func (s *socketClient) startWrite(conn protocol.Conn, stopper chan bool) {
 	defer func() {
 		recover()
 	}()
 	for atomic.LoadUint32(&s.state) == stateReady {
-		p, ok := <-s.outChan
-		if !ok {
+		select {
+		case <-stopper:
 			return
+		case p, ok := <-s.outChan:
+			if !ok {
+				return
+			}
+			err := conn.Write(p)
+			if err != nil {
+				s.emit(EventError, err)
+				close(stopper)
+				return
+			}
 		}
-		err := s.conn.Write(p)
-		if err != nil {
-			s.errChan <- err
-			return
-		}
+
 	}
 }
 
-func (s *socketClient) startPing(h *protocol.Handshake) {
+func (s *socketClient) startPing(h *protocol.Handshake, stopper chan bool) {
 	defer func() {
 		recover()
 	}()
 	for {
 		time.Sleep(time.Duration(h.PingInterval) * time.Millisecond)
+		select {
+		case <-stopper:
+			return
+		default:
+		}
 		if atomic.LoadUint32(&s.state) != stateReady {
 			return
 		}
