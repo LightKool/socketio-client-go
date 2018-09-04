@@ -193,6 +193,8 @@ func (s *socketClient) startPing(h *protocol.Handshake, stopper chan bool) {
 		select {
 		case <-stopper:
 			return
+		case <-s.closeChan:
+			return
 		default:
 		}
 		if atomic.LoadUint32(&s.state) != stateReady {
